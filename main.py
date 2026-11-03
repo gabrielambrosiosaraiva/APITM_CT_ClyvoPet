@@ -10,104 +10,117 @@ import oracledb
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
+from tensorflow.keras.layers import DepthwiseConv2D
 from tensorflow.keras.models import load_model
 
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "modelo" / "keras_model.h5"
-LABELS_PATH = ROOT / "modelo" / "labels.txt"
-IMAGE_SIZE = (224, 224)
+PASTA_PROJETO = Path(__file__).resolve().parent
+CAMINHO_MODELO = PASTA_PROJETO / "modelo" / "keras_model.h5"
+CAMINHO_ROTULOS = PASTA_PROJETO / "modelo" / "labels.txt"
+TAMANHO_IMAGEM = (224, 224)
 
-load_dotenv(ROOT / ".env")
-
-
-def normalize(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    return re.sub(r"[^a-z0-9]", "", value.casefold())
+load_dotenv(PASTA_PROJETO / ".env")
 
 
-def read_labels() -> list[str]:
-    labels: list[str] = []
-    for line in LABELS_PATH.read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
-        if not line:
+def normalizar(valor: str) -> str:
+    valor = unicodedata.normalize("NFKD", valor)
+    valor = "".join(caractere for caractere in valor if not unicodedata.combining(caractere))
+    return re.sub(r"[^a-z0-9]", "", valor.casefold())
+
+
+def ler_rotulos() -> list[str]:
+    rotulos: list[str] = []
+    for linha in CAMINHO_ROTULOS.read_text(encoding="utf-8-sig").splitlines():
+        linha = linha.strip()
+        if not linha:
             continue
-        labels.append(re.sub(r"^\d+\s+", "", line))
-    if not labels:
+        rotulos.append(re.sub(r"^\d+\s+", "", linha))
+    if not rotulos:
         raise RuntimeError("O arquivo labels.txt está vazio.")
-    return labels
+    return rotulos
 
 
 @st.cache_resource
-def load_classifier():
-    return load_model(MODEL_PATH, compile=False)
+def carregar_classificador():
+    """Carrega o modelo do Teachable Machine tratando configurações antigas da camada DepthwiseConv2D."""
+    def convolucao_profundidade_compativel(**argumentos):
+        # Alguns modelos exportados pelo Teachable Machine salvam o parâmetro groups=1.
+        argumentos.pop("groups", None)
+        return DepthwiseConv2D(**argumentos)
+
+    return load_model(
+        CAMINHO_MODELO,
+        compile=False,
+        custom_objects={"DepthwiseConv2D": convolucao_profundidade_compativel},
+    )
 
 
-def connect_oracle():
-    """Connect using Streamlit Secrets online or environment variables locally."""
-    def setting(name: str) -> str | None:
+def conectar_oracle():
+    """Conecta ao Oracle usando os Secrets do Streamlit ou variáveis locais."""
+    def obter_configuracao(nome_variavel: str) -> str | None:
         try:
-            value = st.secrets.get(name)
+            valor = st.secrets.get(nome_variavel)
         except Exception:
-            value = None
-        return value or os.getenv(name)
+            valor = None
+        return valor or os.getenv(nome_variavel)
 
-    user = setting("ORACLE_USER")
-    password = setting("ORACLE_PASSWORD")
-    dsn = setting("ORACLE_DSN")
+    usuario = obter_configuracao("ORACLE_USER")
+    senha = obter_configuracao("ORACLE_PASSWORD")
+    endereco_oracle = obter_configuracao("ORACLE_DSN")
 
-    missing = [
-        name
-        for name, value in (
-            ("ORACLE_USER", user),
-            ("ORACLE_PASSWORD", password),
-            ("ORACLE_DSN", dsn),
+    variaveis_faltando = [
+        nome_variavel
+        for nome_variavel, valor in (
+            ("ORACLE_USER", usuario),
+            ("ORACLE_PASSWORD", senha),
+            ("ORACLE_DSN", endereco_oracle),
         )
-        if not value
+        if not valor
     ]
-    if missing:
+    if variaveis_faltando:
         raise RuntimeError(
             "Configure ORACLE_USER, ORACLE_PASSWORD e ORACLE_DSN em Streamlit Secrets (online) ou no arquivo .env (local)."
         )
 
-    return oracledb.connect(user=user, password=password, dsn=dsn)
-def classify(image: Image.Image) -> tuple[str, float]:
-    model = load_classifier()
-    labels = read_labels()
-    resized = image.convert("RGB").resize(IMAGE_SIZE)
-    pixels = np.asarray(resized, dtype=np.float32)
-    tensor = np.expand_dims((pixels / 127.5) - 1.0, axis=0)
-    scores = np.asarray(model.predict(tensor, verbose=0))[0]
-    if len(scores) != len(labels):
+    return oracledb.connect(user=usuario, password=senha, dsn=endereco_oracle)
+
+
+def classificar_imagem(imagem: Image.Image) -> tuple[str, float]:
+    modelo = carregar_classificador()
+    rotulos = ler_rotulos()
+    imagem_redimensionada = imagem.convert("RGB").resize(TAMANHO_IMAGEM)
+    pixels = np.asarray(imagem_redimensionada, dtype=np.float32)
+    entrada_modelo = np.expand_dims((pixels / 127.5) - 1.0, axis=0)
+    pontuacoes = np.asarray(modelo.predict(entrada_modelo, verbose=0))[0]
+    if len(pontuacoes) != len(rotulos):
         raise RuntimeError(
-            f"O modelo retornou {len(scores)} classes, mas labels.txt contém {len(labels)} rótulos."
+            f"O modelo retornou {len(pontuacoes)} classes, mas labels.txt contém {len(rotulos)} rótulos."
         )
-    index = int(np.argmax(scores))
-    return labels[index], float(scores[index])
+    indice = int(np.argmax(pontuacoes))
+    return rotulos[indice], float(pontuacoes[indice])
 
 
-def fetch_species_care(predicted_breed: str) -> tuple[str, list[dict], bool]:
-    """Return exact breed care when present, otherwise general Canis care."""
-    connection = connect_oracle()
+def buscar_cuidados_especie(raca_prevista: str) -> tuple[str, list[dict], bool]:
+    """Busca os cuidados cadastrados para a raça ou os cuidados gerais para cães."""
+    conexao = conectar_oracle()
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(
+        with conexao.cursor() as cursor_oracle:
+            cursor_oracle.execute(
                 """
                 SELECT id_especie, nome_especie
                 FROM TB_CT_ESPECIE
                 WHERE genero = 'Canis'
                 """
             )
-            species = cursor.fetchall()
+            especies = cursor_oracle.fetchall()
 
-            match = next(
-                (row for row in species if normalize(row[1]) == normalize(predicted_breed)),
+            especie_encontrada = next(
+                (registro for registro in especies if normalizar(registro[1]) == normalizar(raca_prevista)),
                 None,
             )
-            exact_match = match is not None
+            correspondencia_exata = especie_encontrada is not None
 
-            if exact_match:
-                cursor.execute(
+            if correspondencia_exata:
+                cursor_oracle.execute(
                     """
                     SELECT DISTINCT
                         p.nome_predisposicao,
@@ -123,11 +136,11 @@ def fetch_species_care(predicted_breed: str) -> tuple[str, list[dict], bool]:
                     WHERE c.id_especie = :id_especie
                     ORDER BY p.nome_predisposicao, r.gravidade_restricao DESC
                     """,
-                    id_especie=match[0],
+                    id_especie=especie_encontrada[0],
                 )
-                selected_name = match[1]
+                nome_consultado = especie_encontrada[1]
             else:
-                cursor.execute(
+                cursor_oracle.execute(
                     """
                     SELECT DISTINCT
                         p.nome_predisposicao,
@@ -145,26 +158,26 @@ def fetch_species_care(predicted_breed: str) -> tuple[str, list[dict], bool]:
                     ORDER BY p.nome_predisposicao, r.gravidade_restricao DESC
                     """
                 )
-                selected_name = "Canis (cuidados gerais para cães)"
+                nome_consultado = "Canis (cuidados gerais para cães)"
 
-            rows = [
+            registros_cuidado = [
                 {
-                    "predisposicao": row[0],
-                    "orientacao_predisposicao": row[1],
-                    "restricao": row[2],
-                    "orientacao_restricao": row[3],
-                    "gravidade": row[4],
+                    "predisposicao": registro[0],
+                    "orientacao_predisposicao": registro[1],
+                    "restricao": registro[2],
+                    "orientacao_restricao": registro[3],
+                    "gravidade": registro[4],
                 }
-                for row in cursor.fetchall()
+                for registro in cursor_oracle.fetchall()
             ]
-            return selected_name, rows, exact_match
+            return nome_consultado, registros_cuidado, correspondencia_exata
     finally:
-        connection.close()
+        conexao.close()
 
 
-def suggested_question(condition: str) -> str:
-    key = normalize(condition)
-    rules = [
+def sugerir_pergunta(condicao: str) -> str:
+    termo_normalizado = normalizar(condicao)
+    regras = [
         (("respiratorio", "respiracao"), "O pet apresenta tosse, cansaço fácil, respiração ruidosa ou dificuldade para respirar? Em que situações isso acontece?"),
         (("displasia", "coxofemoral", "articulacao"), "Você percebe dificuldade para levantar, mancar, evitar escadas ou sentir dor ao se movimentar?"),
         (("dermatite", "pele", "dobras", "otite"), "Notou coceira, vermelhidão, secreção, mau cheiro ou irritação na pele ou nas orelhas? Quando começou?"),
@@ -176,46 +189,46 @@ def suggested_question(condition: str) -> str:
         (("dentario", "dente", "oral"), "Percebe mau hálito, dificuldade para mastigar, salivação ou resistência ao toque na boca?"),
         (("digestiva", "gastrica", "alimentar", "pelos"), "Houve vômito, alteração nas fezes, desconforto após comer ou mudança no apetite?"),
     ]
-    for keywords, question in rules:
-        if any(normalize(keyword) in key for keyword in keywords):
-            return question
-    return f"Você observou algum sinal relacionado a {condition.lower()}? Quando começou e com que frequência ocorre?"
+    for palavras_chave, pergunta in regras:
+        if any(normalizar(palavra_chave) in termo_normalizado for palavra_chave in palavras_chave):
+            return pergunta
+    return f"Você observou algum sinal relacionado a {condicao.lower()}? Quando começou e com que frequência ocorre?"
 
 
 st.set_page_config(page_title="CLYVO VET | Apoio à teleconsulta", page_icon="🐾", layout="centered")
 st.title("CLYVO VET — Apoio à teleconsulta")
 st.write("Envie uma imagem do pet para classificar a raça, consultar os cuidados associados no Oracle e preparar perguntas de apoio ao veterinário.")
 
-uploaded = st.file_uploader("Imagem do pet", type=["jpg", "jpeg", "png"])
-if uploaded:
-    image = Image.open(uploaded)
-    st.image(image, caption="Imagem recebida", use_container_width=True)
+arquivo_imagem = st.file_uploader("Imagem do pet", type=["jpg", "jpeg", "png"])
+if arquivo_imagem:
+    imagem = Image.open(arquivo_imagem)
+    st.image(imagem, caption="Imagem recebida", use_container_width=True)
     if st.button("Analisar imagem", type="primary"):
         with st.spinner("Classificando a imagem e consultando o Oracle..."):
             try:
-                breed, confidence = classify(image)
+                raca, confianca = classificar_imagem(imagem)
                 st.subheader("Resultado da classificação")
-                st.write(f"**Raça prevista:** {breed}")
-                st.write(f"**Confiança do modelo:** {confidence:.1%}")
-                selected_name, care_rows, exact = fetch_species_care(breed)
+                st.write(f"**Raça prevista:** {raca}")
+                st.write(f"**Confiança do modelo:** {confianca:.1%}")
+                nome_consultado, dados_cuidado, correspondencia_exata = buscar_cuidados_especie(raca)
                 st.subheader("Informações encontradas no banco")
-                st.write(f"**Cadastro consultado:** {selected_name}")
-                if not exact:
+                st.write(f"**Cadastro consultado:** {nome_consultado}")
+                if not correspondencia_exata:
                     st.info("A raça prevista não tem cadastro individual correspondente; foram consultados os cuidados gerais de Canis.")
-                if not care_rows:
+                if not dados_cuidado:
                     st.warning("Nenhuma predisposição ou restrição foi encontrada para essa busca.")
                 else:
-                    questions = []
-                    for item in care_rows:
-                        with st.expander(f"{item['predisposicao']} · {item['restricao']} ({item['gravidade']})"):
-                            st.markdown(f"**Orientação registrada:** {item['orientacao_predisposicao']}")
-                            st.markdown(f"**Restrição:** {item['orientacao_restricao']}")
-                            question = suggested_question(item["predisposicao"] + " " + item["restricao"])
-                            st.markdown(f"**Pergunta sugerida ao tutor:** {question}")
-                            questions.append(question)
+                    perguntas = []
+                    for registro_cuidado in dados_cuidado:
+                        with st.expander(f"{registro_cuidado['predisposicao']} · {registro_cuidado['restricao']} ({registro_cuidado['gravidade']})"):
+                            st.markdown(f"**Orientação registrada:** {registro_cuidado['orientacao_predisposicao']}")
+                            st.markdown(f"**Restrição:** {registro_cuidado['orientacao_restricao']}")
+                            pergunta = sugerir_pergunta(registro_cuidado["predisposicao"] + " " + registro_cuidado["restricao"])
+                            st.markdown(f"**Pergunta sugerida ao tutor:** {pergunta}")
+                            perguntas.append(pergunta)
                     st.subheader("Roteiro de perguntas para o veterinário")
-                    for question in dict.fromkeys(questions):
-                        st.markdown(f"- {question}")
+                    for pergunta in dict.fromkeys(perguntas):
+                        st.markdown(f"- {pergunta}")
                 st.caption("As sugestões apoiam a anamnese; a avaliação clínica cabe ao médico-veterinário.")
-            except Exception as exc:
-                st.error(f"Não foi possível concluir a análise: {exc}")
+            except Exception as erro:
+                st.error(f"Não foi possível concluir a análise: {erro}")
