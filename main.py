@@ -10,11 +10,11 @@ import oracledb
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
-from tensorflow.keras.layers import DepthwiseConv2D
-from tensorflow.keras.models import load_model
+import tensorflow as tf
+from threading import Lock
 
 PASTA_PROJETO = Path(__file__).resolve().parent
-CAMINHO_MODELO = PASTA_PROJETO / "modelo" / "keras_model.h5"
+CAMINHO_MODELO = PASTA_PROJETO / "modelo" / "model.tflite"
 CAMINHO_ROTULOS = PASTA_PROJETO / "modelo" / "labels.txt"
 TAMANHO_IMAGEM = (224, 224)
 
@@ -29,11 +29,11 @@ def normalizar(valor: str) -> str:
 
 def ler_rotulos() -> list[str]:
     rotulos: list[str] = []
-    for linha in CAMINHO_ROTULOS.read_text(encoding="utf-8-sig").splitlines():
-        linha = linha.strip()
-        if not linha:
+    for line in CAMINHO_ROTULOS.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line:
             continue
-        rotulos.append(re.sub(r"^\d+\s+", "", linha))
+        rotulos.append(re.sub(r"^\d+\s+", "", line))
     if not rotulos:
         raise RuntimeError("O arquivo labels.txt está vazio.")
     return rotulos
@@ -41,21 +41,17 @@ def ler_rotulos() -> list[str]:
 
 @st.cache_resource
 def carregar_classificador():
-    """Carrega o modelo do Teachable Machine tratando configurações antigas da camada DepthwiseConv2D."""
-    def convolucao_profundidade_compativel(**argumentos):
-        # Alguns modelos exportados pelo Teachable Machine salvam o parâmetro groups=1.
-        argumentos.pop("groups", None)
-        return DepthwiseConv2D(**argumentos)
+    """Prepara o modelo TensorFlow Lite para classificar imagens."""
+    if not CAMINHO_MODELO.exists():
+        raise FileNotFoundError(
+            "Não encontrei modelo/model.tflite. Exporte o modelo em TensorFlow Lite e coloque-o nessa pasta."
+        )
 
-    return load_model(
-        CAMINHO_MODELO,
-        compile=False,
-        custom_objects={"DepthwiseConv2D": convolucao_profundidade_compativel},
-    )
-
-
+    interpretador = tf.lite.Interpreter(model_path=str(CAMINHO_MODELO))
+    interpretador.allocate_tensors()
+    return interpretador, Lock()
 def conectar_oracle():
-    """Conecta ao Oracle usando os Secrets do Streamlit ou variáveis locais."""
+    """Connect using Streamlit Secrets online or environment variables locally."""
     def obter_configuracao(nome_variavel: str) -> str | None:
         try:
             valor = st.secrets.get(nome_variavel)
@@ -82,25 +78,33 @@ def conectar_oracle():
         )
 
     return oracledb.connect(user=usuario, password=senha, dsn=endereco_oracle)
-
-
 def classificar_imagem(imagem: Image.Image) -> tuple[str, float]:
-    modelo = carregar_classificador()
+    interpretador, cadeado = carregar_classificador()
     rotulos = ler_rotulos()
-    imagem_redimensionada = imagem.convert("RGB").resize(TAMANHO_IMAGEM)
+    dados_entrada = interpretador.get_input_details()[0]
+    dados_saida = interpretador.get_output_details()[0]
+
+    forma_entrada = dados_entrada["shape"]
+    largura = int(forma_entrada[2])
+    altura = int(forma_entrada[1])
+    imagem_redimensionada = imagem.convert("RGB").resize((largura, altura))
     pixels = np.asarray(imagem_redimensionada, dtype=np.float32)
     entrada_modelo = np.expand_dims((pixels / 127.5) - 1.0, axis=0)
-    pontuacoes = np.asarray(modelo.predict(entrada_modelo, verbose=0))[0]
+    entrada_modelo = entrada_modelo.astype(dados_entrada["dtype"])
+
+    with cadeado:
+        interpretador.set_tensor(dados_entrada["index"], entrada_modelo)
+        interpretador.invoke()
+        pontuacoes = interpretador.get_tensor(dados_saida["index"])[0]
+
     if len(pontuacoes) != len(rotulos):
         raise RuntimeError(
             f"O modelo retornou {len(pontuacoes)} classes, mas labels.txt contém {len(rotulos)} rótulos."
         )
     indice = int(np.argmax(pontuacoes))
     return rotulos[indice], float(pontuacoes[indice])
-
-
 def buscar_cuidados_especie(raca_prevista: str) -> tuple[str, list[dict], bool]:
-    """Busca os cuidados cadastrados para a raça ou os cuidados gerais para cães."""
+    """Busca cuidados da raça ou os cuidados gerais para cães."""
     conexao = conectar_oracle()
     try:
         with conexao.cursor() as cursor_oracle:
