@@ -14,7 +14,7 @@ import tensorflow as tf
 from threading import Lock
 
 PASTA_PROJETO = Path(__file__).resolve().parent
-CAMINHO_MODELO = PASTA_PROJETO / "modelo" / "model.tflite"
+CAMINHO_MODELO = PASTA_PROJETO / "modelo" / "model_unquant.tflite"
 CAMINHO_ROTULOS = PASTA_PROJETO / "modelo" / "labels.txt"
 TAMANHO_IMAGEM = (224, 224)
 
