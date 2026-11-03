@@ -1,0 +1,6 @@
+streamlit
+numpy
+oracledb
+Pillow
+python-dotenv
+tensorflow
